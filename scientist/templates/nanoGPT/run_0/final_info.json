@@ -1,0 +1,14 @@
+{
+    "final_train_loss": {
+      "means": 0.7990068793296814
+    },
+    "best_val_loss": {
+      "means": 1.4642348289489746
+    },
+    "total_train_time": {
+      "means": 340408.5938091278
+    },
+    "avg_inference_tokens_per_second": {
+      "means": 58.0441530694019
+    }
+  }
