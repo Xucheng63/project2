@@ -1,0 +1,3 @@
+transformers==4.45.2
+accelerate
+marker-pdf @ git+https://github.com/maxidl/marker-arena.git@ffeb6ee6c1092f1e008000cb8d1d6240a7baeb52
