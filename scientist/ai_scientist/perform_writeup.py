@@ -5,7 +5,9 @@ import os.path as osp
 import re
 import shutil
 import subprocess
+import sys
 from typing import Optional, Tuple
+from pathlib import Path
 
 from ai_scientist.generate_ideas import search_for_papers
 from ai_scientist.llm import get_response_from_llm, extract_json_between_markers, create_client, AVAILABLE_LLMS
@@ -148,7 +150,7 @@ Please make sure the abstract reads smoothly and is well-motivated. This should 
 """,
     "Related Work": """
 - Academic siblings of our work, i.e. alternative attempts in literature at trying to solve the same problem. 
-- Goal is to “Compare and contrast” - how does their approach differ in either assumptions or method? If their method is applicable to our Problem Setting I expect a comparison in the experimental section. If not, there needs to be a clear statement why a given method is not applicable. 
+- Goal is to "Compare and contrast" - how does their approach differ in either assumptions or method? If their method is applicable to our Problem Setting I expect a comparison in the experimental section. If not, there needs to be a clear statement why a given method is not applicable. 
 - Note: Just describing what another paper is doing is not enough. We need to compare and contrast.
 """,
     "Background": """
@@ -188,207 +190,95 @@ error_list = """- Unenclosed math symbols
 - Unnecessary verbosity or repetition, unclear text
 - Results or insights in the `notes.txt` that have not yet need included
 - Any relevant figures that have not yet been included in the text
-- Closing any \\begin{{figure}} with a \\end{{figure}} and \\begin{{table}} with a \\end{{table}}, etc.
-- Duplicate headers, e.g. duplicated \\section{{Introduction}} or \\end{{document}}
+- Closing any \\begin{{}} with \\end{{}}
+- Duplicate headers, e.g. duplicated \\section{{Introduction}} or \\end{{abstract}}
 - Unescaped symbols, e.g. shakespeare_char should be shakespeare\\_char in text
-- Incorrect closing of environments, e.g. </end{{figure}}> instead of \\end{{figure}}
+- LaTeX syntax errors
+- Incorrect closing of environments
+- Duplicate reference labels (e.g. for figures or sections)
 """
 
-refinement_prompt = (
-    """Great job! Now criticize and refine only the {section} that you just wrote.
-Make this complete in this pass, do not leave any placeholders.
+refinement_prompt = """Round {current_round}/{num_rounds}.
 
-Pay particular attention to fixing any errors such as:
+You have written a first draft of the {section}. Please review this draft and make improvements.
+
+Please make sure that the following are addressed in your revision:
+{error_list}
+
+{per_section_tips}
+
+Respond with the full improved {section}. Use *SEARCH/REPLACE* blocks to perform these edits.
 """
-    + error_list
-)
 
-second_refinement_prompt = (
-    """Criticize and refine the {section} only. Recall the advice:
+second_refinement_prompt = """You have written a draft of the entire paper. Please review this draft and make improvements.
+
+For the {section}, recall the following tips:
 {tips}
-Make this complete in this pass, do not leave any placeholders.
 
-Pay attention to how it fits in with the rest of the paper.
-Identify any redundancies (e.g. repeated figures or repeated text), if there are any, decide where in the paper things should be cut.
-Identify where we can save space, and be more concise without weakening the message of the text.
-Fix any remaining errors as before:
-"""
-    + error_list
-)
+Please make sure that the following are addressed in your revision:
+{error_list}
 
-# CITATION HELPERS
-citation_system_msg = """You are an ambitious AI PhD student who is looking to publish a paper that will contribute significantly to the field.
-You have already written an initial draft of the paper and now you are looking to add missing citations to related papers throughout the paper.
-The related work section already has some initial comments on which papers to add and discuss.
-
-Focus on completing the existing write-up and do not add entirely new elements unless necessary.
-Ensure every point in the paper is substantiated with sufficient evidence.
-Feel free to add more cites to a particular point if there is only one or two references.
-Ensure no paper is cited without a corresponding reference in the `references.bib` file.
-Ensure each paragraph of the related work has sufficient background, e.g. a few papers cited.
-You will be given access to the Semantic Scholar API, only add citations that you have found using the API.
-Aim to discuss a broad range of relevant papers, not just the most popular ones.
-Make sure not to copy verbatim from prior literature to avoid plagiarism.
-
-You will be prompted to give a precise description of where and how to add the cite, and a search query for the paper to be cited.
-Finally, you will select the most relevant cite from the search results (top 10 results will be shown).
-You will have {total_rounds} rounds to add to the references, but do not need to use them all.
-
-DO NOT ADD A CITATION THAT ALREADY EXISTS!"""
-
-citation_first_prompt = '''Round {current_round}/{total_rounds}:
-
-You have written this LaTeX draft so far:
-
-"""
-{draft}
+Respond with the full improved {section}. Use *SEARCH/REPLACE* blocks to perform these edits.
 """
 
-Identify the most important citation that you still need to add, and the query to find the paper.
+# Citation prompt
+aider_format = '''Recall the CITATION FORMATTING REQUIREMENTS:
+You want to use \\citet or \\citep to cite references. All citations should be in .bib format and in a file called references.bib.
+For each citation, you MUST use \\citet if the authors are the subject of the sentence, e.g., "\\citet{{doe2020}} proposed a new method."
+You MUST use \\citep for parenthetical citations, e.g., "This method has been proposed (\\citep{{doe2020}})."
 
-Respond in the following format:
+You are currently writing the LaTeX draft contained in template.tex. You have access to the `references.bib` file.
+Based on this LaTeX draft, we have identified a paper that is relevant to cite. Your goal is to properly integrate this new citation at the appropriate location(s) in the paper. 
+However, only cite the paper if you are confident it is truly relevant. 
+If the identified paper is not clearly relevant or would not meaningfully support the content of the paper, or it does not provide any additional context, do not force a citation and just return with "NOTHING".
 
-THOUGHT:
-<THOUGHT>
-
-RESPONSE:
-```json
-<JSON>
-```
-
-In <THOUGHT>, first briefly reason over the paper and identify where citations should be added.
-If no more citations are needed, add "No more citations needed" to your thoughts.
-Do not add "No more citations needed" if you are adding citations this round.
-
-In <JSON>, respond in JSON format with the following fields:
-- "Description": A precise description of the required edit, along with the proposed text and location where it should be made.
-- "Query": The search query to find the paper (e.g. attention is all you need).
-
-Ensure the description is sufficient to make the change without further context. Someone else will make the change.
-The query will work best if you are able to recall the exact name of the paper you are looking for, or the authors.
-This JSON will be automatically parsed, so ensure the format is precise.'''
-
-citation_second_prompt = """Search has recovered the following articles:
-
-{papers}
-
-Respond in the following format:
-
-THOUGHT:
-<THOUGHT>
-
-RESPONSE:
-```json
-<JSON>
-```
-
-In <THOUGHT>, first briefly reason over the search results and identify which citation best fits your paper and the location is to be added at.
-If none are appropriate, add "Do not add any" to your thoughts.
-
-In <JSON>, respond in JSON format with the following fields:
-- "Selected": A list of the indices of the selected papers to be cited, e.g. "[0, 1]". Can be "[]" if no papers are selected. This must be a string.
-- "Description": Update the previous description of the required edit if needed. Ensure that any cites precisely match the name in the bibtex!!!
-
-Do not select papers that are already in the `references.bib` file at the top of the draft, or if the same citation exists under a different name.
-This JSON will be automatically parsed, so ensure the format is precise."""
-
-
-def get_citation_aider_prompt(
-        client, model, draft, current_round, total_rounds, engine="semanticscholar"
-) -> Tuple[Optional[str], bool]:
-    msg_history = []
-    try:
-        text, msg_history = get_response_from_llm(
-            citation_first_prompt.format(
-                draft=draft, current_round=current_round, total_rounds=total_rounds
-            ),
-            client=client,
-            model=model,
-            system_message=citation_system_msg.format(total_rounds=total_rounds),
-            msg_history=msg_history,
-        )
-        if "No more citations needed" in text:
-            print("No more citations needed.")
-            return None, True
-
-        ## PARSE OUTPUT
-        json_output = extract_json_between_markers(text)
-        assert json_output is not None, "Failed to extract JSON from LLM output"
-        query = json_output["Query"]
-        papers = search_for_papers(query, engine=engine)
-    except Exception as e:
-        print(f"Error: {e}")
-        return None, False
-
-    if papers is None:
-        print("No papers found.")
-        return None, False
-
-    paper_strings = []
-    for i, paper in enumerate(papers):
-        paper_strings.append(
-            """{i}: {title}. {authors}. {venue}, {year}.\nAbstract: {abstract}""".format(
-                i=i,
-                title=paper["title"],
-                authors=paper["authors"],
-                venue=paper["venue"],
-                year=paper["year"],
-                abstract=paper["abstract"],
-            )
-        )
-    papers_str = "\n\n".join(paper_strings)
-
-    try:
-        text, msg_history = get_response_from_llm(
-            citation_second_prompt.format(
-                papers=papers_str,
-                current_round=current_round,
-                total_rounds=total_rounds,
-            ),
-            client=client,
-            model=model,
-            system_message=citation_system_msg.format(total_rounds=total_rounds),
-            msg_history=msg_history,
-        )
-        if "Do not add any" in text:
-            print("Do not add any.")
-            return None, False
-        ## PARSE OUTPUT
-        json_output = extract_json_between_markers(text)
-        assert json_output is not None, "Failed to extract JSON from LLM output"
-        desc = json_output["Description"]
-        selected_papers = json_output["Selected"]
-        selected_papers = str(selected_papers)
-
-        # convert to list
-        if selected_papers != "[]":
-            selected_papers = list(map(int, selected_papers.strip("[]").split(",")))
-            assert all(
-                [0 <= i < len(papers) for i in selected_papers]
-            ), "Invalid paper index"
-            bibtexs = [papers[i]["citationStyles"]["bibtex"] for i in selected_papers]
-            bibtex_string = "\n".join(bibtexs)
-        else:
-            return None, False
-
-    except Exception as e:
-        print(f"Error: {e}")
-        return None, False
-
-    # Add citation to draft
-    aider_format = '''The following citations have just been added to the end of the `references.bib` file definition at the top of the file:
+I will now provide you with the BibTeX entry for the new paper to cite.
+BibTeX:
 """
 {bibtex}
 """
-You do not need to add them yourself.
-ABSOLUTELY DO NOT ADD IT AGAIN!!!
 
-Make the proposed change to the draft incorporating these new cites:
+Considering this BibTeX, here is a description of the proposed research:
 {description}
-
-Use your judgment for whether these should be cited anywhere else.
-Make sure that any citation precisely matches the name in `references.bib`. Change its name to the correct name in the bibtex if needed.
 Ensure the citation is well-integrated into the text.'''
+
+
+def get_citation_aider_prompt(client, model, draft, current_round, num_rounds=20, engine="semanticscholar"):
+    if current_round >= num_rounds:
+        return None, True
+
+    # First, try to search for relevant papers using search_for_papers.
+    try:
+        # The search query is designed to find contextually related papers.
+        papers = search_for_papers(draft[:6000], engine=engine)
+        if len(papers) == 0:
+            print("No papers found.")
+            return None, True
+    except Exception as e:
+        print(f"Failed to search for papers: {e}")
+        return None, True
+
+    # Get the most relevant paper from the papers dictionary
+    paper = papers[0]
+    title = paper["title"]
+
+    # Extract the citation from the paper, use {"title":..., "authors":...} as prompt.
+    bibtex_string = paper.get("citationStyles", {}).get("bibtex", None)
+    if bibtex_string is None:
+        print("No citation found.")
+        return None, True
+
+    # Iteratively add these citations to the draft until we have iterated num_rounds times.
+    # If we do not need to add any more citations, we return early.
+    print(f"Identified paper: {title}.")
+    print(f"Citation: {bibtex_string}.")
+    # Aider has a hard limit of 50k characters.
+    if len(bibtex_string) > 50000:
+        bibtex_string = bibtex_string[:50000]
+
+    desc = paper.get("abstract", "")
+    if len(desc) > 1000:
+        desc = desc[:1000]
 
     aider_prompt = (
             aider_format.format(bibtex=bibtex_string, description=desc)
@@ -415,9 +305,13 @@ Be sure to first name the file and use *SEARCH/REPLACE* blocks to perform these 
 """
     coder_out = coder.run(abstract_prompt)
     coder_out = coder.run(
-        refinement_prompt.format(section="Abstract")
-        .replace(r"{{", "{")
-        .replace(r"}}", "}")
+        refinement_prompt.format(
+            section="Abstract",
+            current_round=1,
+            num_rounds=1,
+            error_list=error_list,
+            per_section_tips=per_section_tips["Abstract"]
+        )
     )
     for section in [
         "Introduction",
@@ -442,9 +336,13 @@ Be sure to first name the file and use *SEARCH/REPLACE* blocks to perform these 
 """
         coder_out = coder.run(section_prompt)
         coder_out = coder.run(
-            refinement_prompt.format(section=section)
-            .replace(r"{{", "{")
-            .replace(r"}}", "}")
+            refinement_prompt.format(
+                section=section,
+                current_round=1,
+                num_rounds=1,
+                error_list=error_list,
+                per_section_tips=per_section_tips[section]
+            )
         )
 
     # SKETCH THE RELATED WORK
@@ -481,9 +379,13 @@ Be sure to first name the file and use *SEARCH/REPLACE* blocks to perform these 
             coder_out = coder.run(prompt)
 
     coder_out = coder.run(
-        refinement_prompt.format(section="Related Work")
-        .replace(r"{{", "{")
-        .replace(r"}}", "}")
+        refinement_prompt.format(
+            section="Related Work",
+            current_round=1,
+            num_rounds=1,
+            error_list=error_list,
+            per_section_tips=per_section_tips["Related Work"]
+        )
     )
 
     ## SECOND REFINEMENT LOOP
@@ -503,20 +405,265 @@ First, re-think the Title if necessary. Keep this concise and descriptive of the
     ]:
         coder_out = coder.run(
             second_refinement_prompt.format(
-                section=section, tips=per_section_tips[section]
+                section=section, 
+                tips=per_section_tips[section],
+                error_list=error_list
             )
-            .replace(r"{{", "{")
-            .replace(r"}}", "}")
         )
 
     generate_latex(coder, folder_name, f"{folder_name}/{idea['Name']}.pdf")
+
+
+# ========================================
+# New Feature: OpenReviewer Integration for Review and Optimization
+# ========================================
+
+def call_review_bridge(pdf_path, review_output_dir):
+    """
+    Call review_bridge.py to generate review
+    
+    Args:
+        pdf_path: Path to PDF file
+        review_output_dir: Output directory for review
+    
+    Returns:
+        (review_md_path, success): Review file path and success status
+    """
+    bridge_script = Path(__file__).parent.parent / "tools" / "review_bridge.py"
+    
+    if not bridge_script.exists():
+        print(f"❌ review_bridge.py not found: {bridge_script}")
+        return None, False
+    
+    cmd = [
+        sys.executable,
+        str(bridge_script),
+        "--pdf", str(pdf_path),
+        "--out_dir", str(review_output_dir)
+    ]
+    
+    print(f"\n{'='*70}")
+    print("🔍 Calling OpenReviewer to generate review...")
+    print(f"{'='*70}\n")
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        print(f"❌ Review generation failed:")
+        print(result.stderr)
+        return None, False
+    
+    print(result.stdout)
+    
+    review_path = Path(review_output_dir) / "review.md"
+    return review_path, True
+
+
+def parse_review_feedback(review_path):
+    """
+    Parse review feedback to extract key information
+    
+    Returns:
+        dict: Contains weaknesses, suggestions, score, etc.
+    """
+    review_text = review_path.read_text(encoding='utf-8')
+    
+    feedback = {
+        "weaknesses": [],
+        "suggestions": [],
+        "score": 0,
+        "full_review": review_text
+    }
+    
+    # Extract score
+    score_patterns = [
+        r'(?:score|rating).*?(\d+)(?:/10)?',
+        r'(\d+)(?:/10)',
+    ]
+    
+    for pattern in score_patterns:
+        match = re.search(pattern, review_text, re.IGNORECASE)
+        if match:
+            feedback["score"] = int(match.group(1))
+            break
+    
+    # Parse line by line
+    lines = review_text.split('\n')
+    current_section = None
+    
+    for line in lines:
+        line_lower = line.lower().strip()
+        
+        # Identify section headers
+        if line.startswith('#'):
+            if 'weakness' in line_lower:
+                current_section = 'weaknesses'
+            elif 'suggestion' in line_lower or 'comment' in line_lower or 'improvement' in line_lower:
+                current_section = 'suggestions'
+            else:
+                current_section = None
+        
+        # Collect list items
+        elif current_section and (line.strip().startswith('-') or line.strip().startswith('*')):
+            content = line.strip()[1:].strip()
+            if content:
+                feedback[current_section].append(content)
+    
+    return feedback
+
+
+def generate_improvement_prompt(feedback):
+    """Generate improvement prompt based on review feedback"""
+    
+    weaknesses_text = '\n'.join(f"- {w}" for w in feedback['weaknesses'][:5])  # Limit to first 5
+    suggestions_text = '\n'.join(f"- {s}" for s in feedback['suggestions'][:5])
+    
+    prompt = f"""The paper has been reviewed. Here is the feedback:
+
+**Current Score: {feedback['score']}/10**
+
+**Main Weaknesses:**
+{weaknesses_text if weaknesses_text else "None identified"}
+
+**Improvement Suggestions:**
+{suggestions_text if suggestions_text else "None provided"}
+
+**Full Review (excerpt):**
+{feedback['full_review'][:2000]}...
+
+Please revise the paper (template.tex) to address these issues:
+
+1. Address each weakness mentioned above
+2. Implement the suggestions where applicable
+3. Improve clarity and presentation
+4. Add missing details or experiments if needed
+5. Fix any technical issues
+
+Focus on making substantial improvements to increase the paper quality.
+Use *SEARCH/REPLACE* blocks to edit template.tex.
+"""
+    
+    return prompt
+
+
+def perform_writeup_with_review(
+    idea, 
+    folder_name, 
+    coder, 
+    cite_client, 
+    cite_model,
+    num_cite_rounds=20,
+    enable_review=True,
+    max_review_iterations=1,
+    engine="semanticscholar"
+):
+    """
+    Extended version of perform_writeup with review and optimization features
+    
+    Args:
+        enable_review: Whether to enable review optimization (default True)
+        max_review_iterations: Maximum number of optimization iterations (default 1)
+    """
+    
+    # Step 1: Call original perform_writeup to generate initial draft
+    print("\n" + "="*70)
+    print("📝 Step 1: Generating Initial Draft")
+    print("="*70 + "\n")
+    
+    perform_writeup(idea, folder_name, coder, cite_client, cite_model, num_cite_rounds, engine)
+    
+    # Check if PDF was generated
+    pdf_path = Path(folder_name) / f"{idea['Name']}.pdf"
+    if not pdf_path.exists():
+        print("⚠️ Paper PDF not generated, skipping review")
+        return
+    
+    print(f"\n✅ Initial draft generated: {pdf_path}")
+    
+    # Step 2: Review and optimization (optional)
+    if not enable_review:
+        print("⏭️ Review feature disabled")
+        return
+    
+    print("\n" + "="*70)
+    print("🔍 Step 2: Reviewing and Optimizing Paper")
+    print("="*70 + "\n")
+    
+    for iteration in range(max_review_iterations):
+        print(f"\n--- Optimization Iteration {iteration + 1}/{max_review_iterations} ---\n")
+        
+        # Create review directory
+        review_dir = Path(folder_name) / f"review_iter_{iteration}"
+        review_dir.mkdir(exist_ok=True)
+        
+        # 2.1 Generate review
+        review_path, success = call_review_bridge(
+            pdf_path=pdf_path,
+            review_output_dir=review_dir
+        )
+        
+        if not success or not review_path or not review_path.exists():
+            print("⚠️ Review generation failed, stopping optimization")
+            break
+        
+        # 2.2 Parse feedback
+        print("📊 Parsing review feedback...")
+        feedback = parse_review_feedback(review_path)
+        
+        print(f"   Score: {feedback['score']}/10")
+        print(f"   Weaknesses: {len(feedback['weaknesses'])} items")
+        print(f"   Suggestions: {len(feedback['suggestions'])} items")
+        
+        # Save structured feedback
+        feedback_json_path = review_dir / "feedback.json"
+        with open(feedback_json_path, 'w') as f:
+            json.dump(feedback, f, indent=2, ensure_ascii=False)
+        
+        # Stop if score is high enough
+        if feedback['score'] >= 8:
+            print(f"\n✅ Score reached {feedback['score']}/10, paper quality is good!")
+            break
+        
+        # 2.3 Use Aider to optimize paper
+        print(f"\n🔧 Optimizing paper based on review...")
+        
+        improvement_prompt = generate_improvement_prompt(feedback)
+        
+        try:
+            coder.run(improvement_prompt)
+            
+            # Recompile PDF
+            print("📄 Recompiling PDF...")
+            generate_latex(
+                coder, 
+                folder_name, 
+                str(pdf_path)  # Overwrite original file
+            )
+            
+            # Backup this iteration's paper
+            backup_pdf = review_dir / f"paper_iter_{iteration + 1}.pdf"
+            if pdf_path.exists():
+                shutil.copy(pdf_path, backup_pdf)
+                print(f"✅ Optimized paper saved: {backup_pdf}")
+            
+        except Exception as e:
+            print(f"❌ Optimization failed: {e}")
+            import traceback
+            traceback.print_exc()
+            break
+    
+    print("\n" + "="*70)
+    print("🎉 Paper Generation and Optimization Complete!")
+    print("="*70)
+    print(f"📁 Output Directory: {folder_name}")
+    print(f"📄 Final Paper: {pdf_path}")
+    print("="*70 + "\n")
 
 
 if __name__ == "__main__":
     from aider.coders import Coder
     from aider.models import Model
     from aider.io import InputOutput
-    import json
 
     parser = argparse.ArgumentParser(description="Perform writeup for a project")
     parser.add_argument("--folder", type=str)
@@ -534,6 +681,11 @@ if __name__ == "__main__":
         default="semanticscholar",
         choices=["semanticscholar", "openalex"],
         help="Scholar engine to use.",
+    )
+    parser.add_argument(
+        "--enable-review",
+        action="store_true",
+        help="Enable OpenReviewer-based optimization",
     )
     args = parser.parse_args()
     client, client_model = create_client(args.model)
@@ -574,6 +726,12 @@ if __name__ == "__main__":
         generate_latex(coder, args.folder, f"{args.folder}/test.pdf")
     else:
         try:
-            perform_writeup(idea, folder_name, coder, client, client_model, engine=args.engine)
+            if args.enable_review:
+                perform_writeup_with_review(
+                    idea, folder_name, coder, client, client_model, 
+                    enable_review=True, max_review_iterations=2, engine=args.engine
+                )
+            else:
+                perform_writeup(idea, folder_name, coder, client, client_model, engine=args.engine)
         except Exception as e:
             print(f"Failed to perform writeup: {e}")
